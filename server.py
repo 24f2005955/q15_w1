@@ -1,182 +1,534 @@
+python
+```
+
+import os
 import re
 import json
+import logging
 import sqlite3
-import pandas as pd
+import threading
+from contextlib import asynccontextmanager
+
 import httpx
-from fastapi import FastAPI, Request
+import pandas as pd
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-RATES_URL = "https://exam.sanand.workers.dev/questionData?email=24f2005955%40ds.study.iitm.ac.in&quizSign=qaDMHhDfPMnBJcU%2BFeBuxXtwY7xWzn3xG%2F3dOYEufQcegy95Ub5yeb2%2FcMsgy1taz0jK9uOI9%2FLP49TGZHoOvo04ZWv7CpLwoYiKXSq4h1nBHTQfKO1%2BtDiuqYcmj%2B6wrkOl80aCLFD9B6R7n2PScSGSOeOMsUWcrlzyq0qZ0gSLHMT%2BUpendMsv3NCJy%2FATctMHijhyYtfQpmXa4tQicu9XC3%2FjXGTt4G1OYjw6VOEZCdv3a948waETDJTLl164m6ZyTKd2KU16ha1kCflXNERb4Lpfx66566JYAKaXe0zSgFP0xS9Xl%2FP1ENC0C8qiB1vagsgvfENaUfLkKf0m7w%3D%3D&questionId=q-ledger-agent-server&path=%2Frates"
-EXPORT_URL = "https://exam.sanand.workers.dev/questionData?email=24f2005955%40ds.study.iitm.ac.in&quizSign=qaDMHhDfPMnBJcU%2BFeBuxXtwY7xWzn3xG%2F3dOYEufQcegy95Ub5yeb2%2FcMsgy1taz0jK9uOI9%2FLP49TGZHoOvo04ZWv7CpLwoYiKXSq4h1nBHTQfKO1%2BtDiuqYcmj%2B6wrkOl80aCLFD9B6R7n2PScSGSOeOMsUWcrlzyq0qZ0gSLHMT%2BUpendMsv3NCJy%2FATctMHijhyYtfQpmXa4tQicu9XC3%2FjXGTt4G1OYjw6VOEZCdv3a948waETDJTLl164m6ZyTKd2KU16ha1kCflXNERb4Lpfx66566JYAKaXe0zSgFP0xS9Xl%2FP1ENC0C8qiB1vagsgvfENaUfLkKf0m7w%3D%3D&questionId=q-ledger-agent-server&path=%2Fexport"
+RATES_URL = os.getenv("RATES_URL", "")
+EXPORT_URL = os.getenv("EXPORT_URL", "")
+DATABASE_PATH = os.getenv("DATABASE_PATH", ":memory:")
+DEFAULT_STATUS = os.getenv("DEFAULT_STATUS", "paid").strip().lower()
+
+CORS_ORIGINS = [
+    origin.strip()
+    for origin in os.getenv("CORS_ORIGINS", "*").split(",")
+    if origin.strip()
+]
 
 HEADERS = {
-"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0",
+    "Accept": "application/json, text/plain, */*",
 }
 
-db_conn = sqlite3.connect(":memory:", check_same_thread=False)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ledger_agent")
 
-def init_database():
-    with httpx.Client(timeout=30.0) as client:
-        print("Fetching currency rates from /rates...")
-        resp_rates = client.get(RATES_URL, headers=HEADERS)
-        resp_rates.raise_for_status()
-        usd_rates = resp_rates.json()["usd_per_unit"]
-        print("Currency Rates:", usd_rates)
+db_lock = threading.RLock()
+db_conn = None
 
-        print("Fetching raw order ledger from /export...")
-        resp_export = client.get(EXPORT_URL, headers=HEADERS)
-        resp_export.raise_for_status()
-        raw_lines = resp_export.text.strip().splitlines()
-        rows = [json.loads(line) for line in raw_lines if line.strip()]
-        print(f"Total raw records downloaded: {len(rows)}")
-
-        df = pd.DataFrame(rows)
-
-        # 1. Parse timestamps into timezone-aware UTC
-        df["created_at_utc"] = pd.to_datetime(df["created_at"], format="ISO8601", utc=True)
-        df["updated_at_utc"] = pd.to_datetime(df["updated_at"], format="ISO8601", utc=True)
-
-        # 2. Deduplicate: sort by updated_at ascending and keep the last updated row per order id
-        df = df.sort_values("updated_at_utc", kind="mergesort").drop_duplicates(subset=["id"], keep="last").copy()
-        print(f"Total verified active orders: {len(df)}")
-
-        # 3. Convert business dates to Asia/Kolkata timezone
-        ist_created = df["created_at_utc"].dt.tz_convert("Asia/Kolkata")
-        df["created_date"] = ist_created.dt.strftime("%Y-%m-%d")
-        df["created_month"] = ist_created.dt.strftime("%Y-%m")
-        df["created_year"] = ist_created.dt.year
-
-        # 4. Standardize all transactions into USD
-        df["rate_to_usd"] = df["currency"].map(usd_rates)
-        df["amount_usd"] = df["amount"] * df["rate_to_usd"]
-
-        df_sql = df.drop(columns=["created_at_utc", "updated_at_utc"])
-        df_sql.to_sql("orders", db_conn, index=False, if_exists="replace")
-        print("In-memory SQLite database ready.")
-
-init_database()
+REQUIRED_COLUMNS = {
+    "id", "created_at", "updated_at", "currency", "amount",
+    "status", "region", "product", "customer", "qty",
+}
 
 MONTH_MAP = {
-"january": "01", "february": "02", "march": "03", "april": "04",
-"may": "05", "june": "06", "july": "07", "august": "08",
-"september": "09", "october": "10", "november": "11", "december": "12"
+    "january": 1, "february": 2, "march": 3, "april": 4,
+    "may": 5, "june": 6, "july": 7, "august": 8,
+    "september": 9, "october": 10, "november": 11,
+    "december": 12,
 }
 
 PRODUCTS = [
-"Air Fryer", "Rice Cooker", "Juicer", "Toaster",
-"Mixer", "Kettle", "Blender", "Grinder"
+    "Air Fryer", "Rice Cooker", "Juicer", "Toaster",
+    "Mixer", "Kettle", "Blender", "Grinder",
 ]
 
 REGIONS = ["North", "South", "East", "West", "Central"]
 
-def parse_question_to_sql(question: str):    
-    q_low = question.lower()
+STATUS_PATTERNS = [
+    (r"\b(refunded|refunds|refund)\b", "refunded"),
+    (r"\b(voided|void)\b", "void"),
+    (r"\b(cancelled|canceled|cancel)\b", "void"),
+    (r"\b(pending|unpaid)\b", "pending"),
+    (r"\b(paid|successful|completed)\b", "paid"),
+]
+
+def fetch_order_records(client):
+    if not EXPORT_URL:
+        raise ValueError("Set the EXPORT_URL environment variable.")
+
+    response = client.get(EXPORT_URL, headers=HEADERS)
+    response.raise_for_status()
+
+    content = response.text.strip()
+    if not content:
+        raise ValueError("The order export is empty.")
+
+    try:
+        payload = response.json()
+
+        if isinstance(payload, list):
+            records = payload
+        elif isinstance(payload, dict) and isinstance(payload.get("data"), list):
+            records = payload["data"]
+        elif isinstance(payload, dict) and isinstance(payload.get("orders"), list):
+            records = payload["orders"]
+        elif isinstance(payload, dict):
+            records = [payload]
+        else:
+            raise ValueError("Unexpected export format.")
+
+    except (json.JSONDecodeError, ValueError):
+        records = [
+            json.loads(line)
+            for line in content.splitlines()
+            if line.strip()
+        ]
+
+    if not records or not all(isinstance(item, dict) for item in records):
+        raise ValueError("Export must contain JSON order records.")
+
+    return records
+
+def fetch_currency_rates(client):
+    if not RATES_URL:
+        raise ValueError("Set the RATES_URL environment variable.")
+
+    response = client.get(RATES_URL, headers=HEADERS)
+    response.raise_for_status()
+
+    rates = response.json().get("usd_per_unit")
+
+    if not isinstance(rates, dict) or not rates:
+        raise ValueError("Rates response must contain usd_per_unit.")
+
+    normalized = {}
+
+    for currency, rate in rates.items():
+        try:
+            value = float(rate)
+        except (TypeError, ValueError):
+            raise ValueError(f"Invalid rate for {currency}.") from None
+
+        if not pd.notna(value) or value <= 0:
+            raise ValueError(f"Invalid rate for {currency}.")
+
+        normalized[str(currency).strip().upper()] = value
+
+    return normalized
+
+def build_dataframe(records, rates):
+    df = pd.DataFrame(records)
+
+    missing = REQUIRED_COLUMNS - set(df.columns)
+    if missing:
+        raise ValueError(
+            "Missing required columns: " + ", ".join(sorted(missing))
+        )
+
+    for column in [
+        "id", "currency", "status", "region", "product", "customer"
+    ]:
+        df[column] = df[column].astype("string").str.strip()
+
+    if df["id"].isna().any() or df["id"].eq("").any():
+        raise ValueError("Order IDs cannot be empty.")
+
+    df["currency"] = df["currency"].str.upper()
+    df["status"] = df["status"].str.lower()
+
+    df["created_at_utc"] = pd.to_datetime(
+        df["created_at"], format="ISO8601", utc=True, errors="raise"
+    )
+    df["updated_at_utc"] = pd.to_datetime(
+        df["updated_at"], format="ISO8601", utc=True, errors="raise"
+    )
+
+    df = (
+        df.sort_values("updated_at_utc", kind="mergesort")
+        .drop_duplicates(subset=["id"], keep="last")
+        .copy()
+    )
+
+    df["amount"] = pd.to_numeric(df["amount"], errors="raise")
+    df["qty"] = pd.to_numeric(df["qty"], errors="raise")
+
+    if df["amount"].isna().any() or df["qty"].isna().any():
+        raise ValueError("Amounts and quantities cannot be missing.")
+
+    ist_created = df["created_at_utc"].dt.tz_convert("Asia/Kolkata")
+    df["created_date"] = ist_created.dt.strftime("%Y-%m-%d")
+    df["created_month"] = ist_created.dt.strftime("%Y-%m")
+    df["created_month_num"] = ist_created.dt.month
+    df["created_year"] = ist_created.dt.year
+
+    df["rate_to_usd"] = df["currency"].map(rates)
+
+    if df["rate_to_usd"].isna().any():
+        missing_currencies = sorted(
+            df.loc[df["rate_to_usd"].isna(), "currency"]
+            .dropna().unique().tolist()
+        )
+        raise ValueError(
+            "Missing rates for: " + ", ".join(missing_currencies)
+        )
+
+    df["amount_usd"] = df["amount"] * df["rate_to_usd"]
+
+    if not df["amount_usd"].map(pd.notna).all():
+        raise ValueError("Currency conversion produced invalid amounts.")
+
+    allowed_statuses = {"paid", "refunded", "void", "pending"}
+    unknown = set(df["status"].dropna()) - allowed_statuses
+
+    if unknown:
+        raise ValueError(
+            "Unknown statuses: " + ", ".join(sorted(unknown))
+        )
+
+    return df.drop(columns=["created_at_utc", "updated_at_utc"])
+
+def initialize_database():
+    global db_conn
+
+    timeout = httpx.Timeout(30.0, connect=10.0)
+
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        rates = fetch_currency_rates(client)
+        records = fetch_order_records(client)
+
+    df = build_dataframe(records, rates)
+
+    new_conn = sqlite3.connect(
+        DATABASE_PATH,
+        check_same_thread=False,
+        timeout=30.0,
+    )
+
+    try:
+        df.to_sql("orders", new_conn, index=False, if_exists="replace")
+        new_conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_id ON orders(id)"
+        )
+        new_conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_orders_date "
+            "ON orders(created_date)"
+        )
+        new_conn.commit()
+    except Exception:
+        new_conn.close()
+        raise
+
+    with db_lock:
+        old_conn = db_conn
+        db_conn = new_conn
+
+        if old_conn is not None:
+            old_conn.close()
+
+    logger.info("Database initialized with %d orders.", len(df))
+
+def parse_question_to_sql(question):
+    if not isinstance(question, str) or not question.strip():
+        raise ValueError("Question must be a non-empty string.")
+
+    q = question.strip().lower()
     conditions = []
+    params = []
 
-    # Status classification
-    if re.search(r"\brefund(ed|s)?\b", q_low):
-        conditions.append("status = 'refunded'")
-    elif re.search(r"\b(void|voided|cancel|cancelled)\b", q_low):
-        conditions.append("status = 'void'")
-    else:
-        conditions.append("status = 'paid'")
+    all_statuses = bool(re.search(
+        r"\b(all statuses|every status|regardless of status|"
+        r"including refunds|including refunded|all orders)\b",
+        q,
+    ))
 
-    # Region filter
-    for reg in REGIONS:
-        if re.search(rf"\b{reg.lower()}\b", q_low):
-            conditions.append(f"region = '{reg}'")
+    if not all_statuses:
+        selected_status = None
+
+        for pattern, status in STATUS_PATTERNS:
+            if re.search(pattern, q):
+                selected_status = status
+                break
+
+        if selected_status is None:
+            selected_status = DEFAULT_STATUS
+
+        if selected_status not in {"paid", "refunded", "void", "pending"}:
+            raise ValueError("Invalid DEFAULT_STATUS configuration.")
+
+        conditions.append("LOWER(status) = ?")
+        params.append(selected_status)
+
+    for region in REGIONS:
+        if re.search(rf"\b{re.escape(region.lower())}\b", q):
+            conditions.append("region = ?")
+            params.append(region)
             break
 
-    # Product filter
-    for prod in PRODUCTS:
-        if re.search(rf"\b{re.escape(prod.lower())}s?\b", q_low):
-            conditions.append(f"product = '{prod}'")
+    for product in PRODUCTS:
+        if re.search(rf"\b{re.escape(product.lower())}s?\b", q):
+            conditions.append("product = ?")
+            params.append(product)
             break
 
-    # Customer ID filter
-    cust_match = re.search(r"\b(c\d{4})\b", q_low)
-    if cust_match:
-        conditions.append(f"customer = '{cust_match.group(1).upper()}'")
+    customer_match = re.search(r"\b(c\d{4})\b", q)
+    if customer_match:
+        conditions.append("UPPER(customer) = ?")
+        params.append(customer_match.group(1).upper())
 
-    # Date / Month / Year filter
-    year_match = re.search(r"\b(202\d)\b", q_low)
-    year_str = year_match.group(1) if year_match else "2026"
+    year_match = re.search(r"\b(20\d{2})\b", q)
+    year = int(year_match.group(1)) if year_match else None
 
     month_num = None
-    for m_name, m_val in MONTH_MAP.items():
-        if re.search(rf"\b{m_name}\b", q_low):
-            month_num = m_val
+    for month_name, month_number in MONTH_MAP.items():
+        if re.search(rf"\b{month_name}\b", q):
+            month_num = month_number
             break
 
-    if month_num:
-        conditions.append(f"created_month = '{year_str}-{month_num}'")
-    elif year_match and "month" not in q_low:
-        conditions.append(f"created_year = {year_str}")
+    if month_num is not None:
+        conditions.append("created_month_num = ?")
+        params.append(month_num)
 
-    where_clause = " AND ".join(conditions) if conditions else "1=1"
+    if year is not None:
+        conditions.append("created_year = ?")
+        params.append(year)
 
-    # Route by question intent
-    if any(p in q_low for p in ["which product", "what product", "top-selling product", "best-selling product", "product earned the most"]):
-        order_metric = "SUM(qty)" if any(w in q_low for w in ["qty", "quantity", "units"]) else "SUM(amount_usd)"
-        sql = f"SELECT product FROM orders WHERE {where_clause} GROUP BY product ORDER BY {order_metric} DESC LIMIT 1"
-        return sql, "string"
+    where_clause = (
+        " WHERE " + " AND ".join(conditions)
+        if conditions else ""
+    )
 
-    if any(p in q_low for p in ["which customer", "what customer", "top customer", "customer spent the most"]):
-        sql = f"SELECT customer FROM orders WHERE {where_clause} GROUP BY customer ORDER BY SUM(amount_usd) DESC LIMIT 1"
-        return sql, "string"
+    is_count = bool(re.search(
+        r"\b(how many|count|number of|count the|order count|total number)\b",
+        q,
+    ))
 
-    if any(p in q_low for p in ["which region", "what region", "top region", "region earned the most"]):
-        sql = f"SELECT region FROM orders WHERE {where_clause} GROUP BY region ORDER BY SUM(amount_usd) DESC LIMIT 1"
-        return sql, "string"
+    if is_count and re.search(
+        r"\b(distinct|unique|different)\s+customers?\b", q
+    ):
+        return (
+            "SELECT COUNT(DISTINCT customer) FROM orders" + where_clause,
+            params,
+            "int",
+        )
 
-    if any(p in q_low for p in ["distinct customer", "different customer", "unique customer", "how many customer"]):
-        sql = f"SELECT COUNT(DISTINCT customer) FROM orders WHERE {where_clause}"
-        return sql, "int"
+    if is_count and re.search(r"\b(customers?|clients?)\b", q):
+        return (
+            "SELECT COUNT(DISTINCT customer) FROM orders" + where_clause,
+            params,
+            "int",
+        )
 
-    if "average" in q_low:
-        sql = f"SELECT ROUND(COALESCE(AVG(amount_usd), 0), 2) FROM orders WHERE {where_clause}"
-        return sql, "money"
+    if (
+        is_count and re.search(r"\b(units?|quantities|items?)\b", q)
+    ) or re.search(
+        r"\b(total quantity|total units|units sold|quantity sold|how many units)\b",
+        q,
+    ):
+        return (
+            "SELECT COALESCE(SUM(qty), 0) FROM orders" + where_clause,
+            params,
+            "int",
+        )
 
-    if any(p in q_low for p in ["how many orders", "count the", "number of orders", "how many refunded"]):
-        sql = f"SELECT COUNT(*) FROM orders WHERE {where_clause}"
-        return sql, "int"
+    if is_count and re.search(r"\borders?\b", q):
+        return (
+            "SELECT COUNT(*) FROM orders" + where_clause,
+            params,
+            "int",
+        )
 
-    if any(p in q_low for p in ["how many units", "total quantity", "total units"]):
-        sql = f"SELECT COALESCE(SUM(qty), 0) FROM orders WHERE {where_clause}"
-        return sql, "int"
+    if re.search(r"\b(average|avg)\b", q):
+        return (
+            "SELECT ROUND(COALESCE(AVG(amount_usd), 0), 2) "
+            "FROM orders" + where_clause,
+            params,
+            "money",
+        )
 
-    # Default: Total Revenue / Earnings / Sales
-    sql = f"SELECT ROUND(COALESCE(SUM(amount_usd), 0), 2) FROM orders WHERE {where_clause}"
-    return sql, "money"
+    ranking_words = (
+        "top", "most", "highest", "best-selling", "top-selling",
+        "best selling", "top selling", "largest", "greatest",
+    )
+    is_ranking = any(word in q for word in ranking_words)
 
-app = FastAPI()
-app.add_middleware(
-CORSMiddleware,
-allow_origins=[""],
-allow_methods=[""],
-allow_headers=["*"],
+    product_ranking = (
+        "which product" in q
+        or "what product" in q
+        or ("product" in q and is_ranking)
+        or "product earned the most" in q
+    )
+
+    if product_ranking:
+        metric = (
+            "SUM(qty)"
+            if re.search(r"\b(units?|quantity|qty)\b", q)
+            else "SUM(amount_usd)"
+        )
+        return (
+            "SELECT product FROM orders" + where_clause
+            + f" GROUP BY product ORDER BY {metric} DESC, "
+              "product ASC LIMIT 1",
+            params,
+            "string",
+        )
+
+    customer_ranking = (
+        "which customer" in q
+        or "what customer" in q
+        or ("customer" in q and is_ranking)
+        or "customer spent the most" in q
+    )
+
+    if customer_ranking:
+        return (
+            "SELECT customer FROM orders" + where_clause
+            + " GROUP BY customer "
+              "ORDER BY SUM(amount_usd) DESC, customer ASC LIMIT 1",
+            params,
+            "string",
+        )
+
+    region_ranking = (
+        "which region" in q
+        or "what region" in q
+        or ("region" in q and is_ranking)
+        or "region earned the most" in q
+    )
+
+    if region_ranking:
+        return (
+            "SELECT region FROM orders" + where_clause
+            + " GROUP BY region "
+              "ORDER BY SUM(amount_usd) DESC, region ASC LIMIT 1",
+            params,
+            "string",
+        )
+
+    return (
+        "SELECT ROUND(COALESCE(SUM(amount_usd), 0), 2) "
+        "FROM orders" + where_clause,
+        params,
+        "money",
+    )
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    initialize_database()
+    yield
+
+    global db_conn
+    with db_lock:
+        if db_conn is not None:
+            db_conn.close()
+            db_conn = None
+
+app = FastAPI(
+    title="Ledger Agent API",
+    version="2.0.0",
+    lifespan=lifespan,
 )
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials="*" not in CORS_ORIGINS,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+@app.get("/health")
+async def health():
+    with db_lock:
+        ready = db_conn is not None
+
+    return {
+        "status": "ok" if ready else "not_ready",
+        "database_ready": ready,
+    }
 
 @app.post("/")
 async def answer_question(request: Request):
-    body = await request.json()
-    question = body.get("question", "")
-    print(f"\n[INCOMING QUESTION] {question}")
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Request body must contain valid JSON.",
+        ) from None
 
-    sql_query, ans_type = parse_question_to_sql(question)
-    print(f"[SQL EXECUTED] {sql_query}")
+    if not isinstance(body, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="Request body must be a JSON object.",
+        )
 
-    cursor = db_conn.cursor()
-    cursor.execute(sql_query)
-    row = cursor.fetchone()
-    val = row[0] if row and row[0] is not None else 0
+    question = body.get("question")
 
-    if ans_type == "string":
-        result = str(val)
-    elif ans_type == "int":
-        result = int(val)
-    else:
-        result = round(float(val), 2)
+    if not isinstance(question, str) or not question.strip():
+        raise HTTPException(
+            status_code=422,
+            detail="'question' must be a non-empty string.",
+        )
 
-    print(f"[RESPONSE] {result}")
-    return {"answer": result}
+    try:
+        sql_query, sql_params, answer_type = parse_question_to_sql(question)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+
+    logger.info("Question: %s", question)
+    logger.info("SQL: %s", sql_query)
+
+    try:
+        with db_lock:
+            if db_conn is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Database is not initialized.",
+                )
+
+            row = db_conn.execute(sql_query, sql_params).fetchone()
+
+        value = row[0] if row else None
+
+        if value is None:
+            result = "" if answer_type == "string" else 0
+        elif answer_type == "string":
+            result = str(value)
+        elif answer_type == "int":
+            result = int(value)
+        else:
+            result = round(float(value), 2)
+
+        logger.info("Answer: %s", result)
+        return {"answer": result}
+
+    except HTTPException:
+        raise
+    except sqlite3.Error:
+        logger.exception("Database query failed.")
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to execute the ledger query.",
+        ) from None
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "8000")),
+        reload=False,
+    )
+```
